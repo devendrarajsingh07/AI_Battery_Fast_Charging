@@ -4,7 +4,7 @@ Trains a **Soft Actor-Critic (SAC)** reinforcement learning agent to adaptively
 control lithium-ion battery charging — faster charging, less heat, better longevity.
 
 ---
-
+ live app at   devrajsingh07.streamlit.app 
 
 ## What's inside
 
