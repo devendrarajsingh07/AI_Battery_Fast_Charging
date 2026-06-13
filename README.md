@@ -5,19 +5,6 @@ control lithium-ion battery charging — faster charging, less heat, better long
 
 ---
 
-## Quick start
-
-```bash
-# 1. clone / download the project, then:
-pip install -r requirements.txt
-
-# 2. Launch the dashboard
-streamlit run dashboard/app.py
-```
-
-Open `http://localhost:8501` in your browser. Hit **Run Simulation** in the sidebar.
-
----
 
 ## What's inside
 
