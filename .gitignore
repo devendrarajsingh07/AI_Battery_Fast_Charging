@@ -5,9 +5,9 @@ __pycache__/
 *.pyd
 .Python
 
-# Virtual environment
+# Virtual environment — only ignore venv/, NOT env/ (that's our RL env package)
 venv/
-env/
+.venv/
 .env
 
 # Jupyter
