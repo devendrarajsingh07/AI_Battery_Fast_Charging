@@ -11,33 +11,33 @@ Main assumptions:
 References:
   - Doyle, Fuller, Newman (1993) J. Electrochem. Soc.
   - Marquis et al. (2019) J. Electrochem. Soc. — SPM analysis
-  - Chen et al. (2020) — parameter set used for OCV fit
+  - Chen et al. (2020) — NMC / graphite reference parameter set
 """
 
 import numpy as np
 
 
 # ──────────────────────────────────────────────
-# OCV lookup for NMC 622 cathode (vs Li/Li+)
-# Polynomial fit from Chen2020 half-cell data.
+# Full-cell OCV for NMC 622 / graphite
+# Degree-6 polynomial fitted to a representative full-cell curve.
 # Valid range: SOC ∈ [0.01, 0.99]
 # ──────────────────────────────────────────────
 
-# Coefficients for: V = Σ c_i * SOC^i  (degree 6)
-# Fitted so that:
+# Coefficients for: V = Σ c_i * SOC^i  (degree 6, monotonic on [0, 1])
+# Fitted so that (max fit error < 20 mV):
 #   SOC=0.0 → ~3.00 V
 #   SOC=0.2 → ~3.47 V
 #   SOC=0.5 → ~3.70 V
 #   SOC=0.8 → ~3.95 V
 #   SOC=1.0 → ~4.20 V
 _OCV_POLY = np.array([
-    3.0050,    # c0
-    3.1200,    # c1
-   -5.8140,    # c2
-   14.9800,    # c3
-  -22.6700,    # c4
-   18.5300,    # c5
-   -6.2800,    # c6
+     3.0091,    # c0
+     5.6825,    # c1
+   -29.0054,    # c2
+    83.1047,    # c3
+  -123.7293,    # c4
+    91.6506,    # c5
+   -26.5169,    # c6
 ])
 
 
@@ -138,6 +138,31 @@ class SingleParticleModel:
             + self.overpotential(current, temperature)
         )
         return float(min(v, 4.25))
+
+    # ------------------------------------------------------------------
+    def max_current_for_voltage(self, v_max: float, temperature: float,
+                                i_upper: float) -> float:
+        """
+        Largest charging current (A, up to i_upper) that keeps the terminal
+        voltage at or below v_max. This is the constant-voltage (CV) limit a
+        charger applies once the cell reaches its voltage ceiling.
+        """
+        headroom = lambda i: (
+            self.ocv() + i * self.r_internal(temperature)
+            + self.overpotential(i, temperature) - v_max
+        )
+        if headroom(i_upper) <= 0.0:
+            return float(i_upper)
+        if headroom(0.0) >= 0.0:
+            return 0.0
+        lo, hi = 0.0, float(i_upper)
+        for _ in range(40):                       # bisection, ~1e-11 A tolerance
+            mid = 0.5 * (lo + hi)
+            if headroom(mid) > 0.0:
+                hi = mid
+            else:
+                lo = mid
+        return lo
 
     # ------------------------------------------------------------------
     def update_soc(self, current: float):

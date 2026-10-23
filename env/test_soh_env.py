@@ -10,7 +10,8 @@ while not done:
 
     action = env.action_space.sample()
 
-    state, reward, done, _, _ = env.step(action)
+    state, reward, terminated, truncated, _ = env.step(action)
+    done = terminated or truncated
 
     print(
         f"SOC={state[0]:.2f}, "

@@ -30,15 +30,16 @@ while not done:
         deterministic=True
     )
 
-    state, reward, done, _, _ = env.step(
+    state, reward, terminated, truncated, info = env.step(
         action
     )
+    done = terminated or truncated
 
     print(
         f"SOC={state[0]:.2f}, "
         f"Voltage={state[1]:.2f}, "
         f"Temp={state[2]:.2f}, "
-        f"Action={action[0]:.2f}, "
+        f"C-rate={info['current']:.2f} ({info['mode']}), "
         f"Reward={reward:.2f}"
     )
 

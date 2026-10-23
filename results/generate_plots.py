@@ -1,8 +1,9 @@
 """
 Generate static result plots from one charging episode.
 
-Uses a fixed 1.7 C-rate action (no RL agent required) so anyone
-can regenerate the plots without needing the trained weights.
+Runs the trained SAC agent if results/models/continuous_sac_model.zip
+exists; otherwise falls back to a fixed 2C CC-CV charge so anyone can
+regenerate the plots without the trained weights.
 
 Usage (from project root):
     python results/generate_plots.py
@@ -58,11 +59,19 @@ temp_history  = []
 soh_history   = []
 current_history = []
 
-done = False
-action = np.array([1.7], dtype=np.float32)   # 1.7 C — decent fast-charge rate
+MODEL_PATH = os.path.join(os.path.dirname(__file__), "models", "continuous_sac_model.zip")
+if os.path.exists(MODEL_PATH):
+    from stable_baselines3 import SAC
+    model = SAC.load(MODEL_PATH, device="cpu")
+    policy = lambda s: model.predict(s, deterministic=True)[0]
+    print("Policy: trained SAC agent")
+else:
+    policy = lambda s: np.array([2.0], dtype=np.float32)
+    print("Policy: fixed 2C CC-CV (no trained model found)")
 
-while not done:
-    state, reward, done, _, info = env.step(action)
+done = truncated = False
+while not (done or truncated):
+    state, reward, done, truncated, info = env.step(policy(state))
     soc_history.append(info["soc"])
     voltage_history.append(info["voltage"])
     temp_history.append(info["temperature"])
@@ -79,7 +88,7 @@ os.makedirs(out_dir, exist_ok=True)
 def savefig(name, y_data, ylabel, color, hline=None, hline_label=""):
     fig, ax = plt.subplots(figsize=(9, 4.5))
     ax.plot(steps, y_data, color=color)
-    ax.fill_between(steps, y_data, alpha=0.12, color=color)
+    ax.fill_between(steps, y_data, min(y_data), alpha=0.12, color=color)
     if hline is not None:
         ax.axhline(hline, color="#f85149", linestyle="--", linewidth=1.2,
                    label=hline_label)
@@ -95,15 +104,15 @@ def savefig(name, y_data, ylabel, color, hline=None, hline_label=""):
 
 
 # ── plot each metric ─────────────────────────────────────────────────
-print(f"\nEpisode length: {len(steps)} steps ({len(steps) * 60 // 60} min simulated)\n")
+print(f"\nEpisode length: {len(steps)} steps ({len(steps)} min simulated)\n")
 
 savefig("soc_vs_time.png",         soc_history,     "State of Charge",     COLOR["soc"],
         hline=0.80, hline_label="Target 80 %")
 savefig("voltage_vs_time.png",     voltage_history, "Terminal Voltage (V)", COLOR["volt"],
-        hline=4.20, hline_label="CV cutoff 4.20 V")
+        hline=4.20, hline_label="CV limit 4.20 V")
 savefig("temperature_vs_time.png", temp_history,    "Temperature (°C)",    COLOR["temp"],
         hline=45, hline_label="Safety limit 45 °C")
 savefig("soh_vs_time.png",         soh_history,     "State of Health",     COLOR["soh"])
-savefig("current_vs_time.png",     current_history, "Charging Current (C)", COLOR["curr"])
+savefig("current_vs_time.png",     current_history, "Charging Current (C-rate)", COLOR["curr"])
 
 print("\nAll plots saved to results/plots/")

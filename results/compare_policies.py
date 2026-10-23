@@ -1,8 +1,10 @@
 """
-Compare the trained SAC agent against constant-current charging.
+Compare the trained SAC agent against standard CC-CV charging.
 
-Runs one episode per policy in ContinuousBatteryEnv, prints a summary
-table and saves results/plots/rl_vs_constant.png.
+Each baseline requests a constant C-rate; the environment's charger switches
+to constant voltage at 4.20 V, so every baseline is a normal CC-CV profile.
+Runs one episode per policy from 10 % SOC, prints a summary table and saves
+results/plots/rl_vs_constant.png.
 
 Usage (from project root):
     python results/compare_policies.py
@@ -40,25 +42,28 @@ mpl.rcParams.update({
 })
 
 MODEL_PATH = "results/models/continuous_sac_model"
-CONSTANT_RATES = [1.5, 2.0, 2.5]
-COLORS = {"SAC agent": "#39d353", 1.5: "#58a6ff", 2.0: "#bc8cff", 2.5: "#ff7b72"}
+CONSTANT_RATES = [1.0, 2.0, 3.0]
+COLORS = {"SAC agent": "#39d353", 1.0: "#58a6ff", 2.0: "#bc8cff", 3.0: "#ff7b72"}
 
 
 def run_episode(policy):
     env = ContinuousBatteryEnv()
     state, _ = env.reset()
     hist = {"soc": [], "temperature": [], "voltage": [], "current": [], "soh": []}
-    done = False
-    while not done:
-        state, _, done, _, info = env.step(policy(state))
-        for k in hist:
+    hist["cv_start"] = None
+    done = truncated = False
+    while not (done or truncated):
+        state, _, done, truncated, info = env.step(policy(state))
+        for k in ("soc", "temperature", "voltage", "current", "soh"):
             hist[k].append(info[k])
+        if hist["cv_start"] is None and info["mode"] == "CV":
+            hist["cv_start"] = info["soc"]
     if info["soc"] >= 0.80:
-        hist["end"] = "SOC target"
+        hist["end"] = "80 % reached"
     elif info["temperature"] >= 45.0:
         hist["end"] = "45 °C limit"
-    elif info["voltage"] >= 4.20:
-        hist["end"] = "4.20 V cutoff"
+    elif truncated:
+        hist["end"] = "time limit"
     else:
         hist["end"] = "SOH limit"
     return hist
@@ -70,27 +75,34 @@ for rate in CONSTANT_RATES:
     runs[rate] = run_episode(lambda s, r=rate: np.array([r], dtype=np.float32))
 
 # ── summary table ───────────────────────────────────────────────────
-print(f"\n{'Policy':<16}{'Minutes':>8}{'Final SOC':>11}{'Peak T':>9}{'Final SOH':>11}  Ended by")
+def label_of(name):
+    return name if isinstance(name, str) else f"CC-CV {name:.0f}C"
+
+
+print(f"\n{'Policy':<12}{'Minutes':>8}{'Final SOC':>11}{'Peak T':>9}{'Final SOH':>11}{'CV from':>9}  Ended by")
 for name, h in runs.items():
-    label = name if isinstance(name, str) else f"Constant {name}"
-    print(f"{label:<16}{len(h['soc']):>8}{h['soc'][-1]:>10.1%}"
-          f"{max(h['temperature']):>8.1f}°{h['soh'][-1]:>11.4f}  {h['end']}")
+    cv = f"{h['cv_start']:.0%}" if h["cv_start"] is not None else "—"
+    print(f"{label_of(name):<12}{len(h['soc']):>8}{h['soc'][-1]:>10.1%}"
+          f"{max(h['temperature']):>8.1f}°{h['soh'][-1]:>11.4f}{cv:>9}  {h['end']}")
 
 # ── chart ───────────────────────────────────────────────────────────
-fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4.5))
+fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(16, 4.5))
 for name, h in runs.items():
-    label = name if isinstance(name, str) else f"Constant {name}"
+    label = label_of(name)
     width = 2.6 if isinstance(name, str) else 1.6
     t = range(1, len(h["soc"]) + 1)
     ax1.plot(t, np.array(h["soc"]) * 100, color=COLORS[name], lw=width, label=label)
-    ax2.plot(t, h["temperature"], color=COLORS[name], lw=width, label=label)
+    ax2.plot(t, h["current"], color=COLORS[name], lw=width, label=label)
+    ax3.plot(t, h["temperature"], color=COLORS[name], lw=width, label=label)
 
-ax2.axhline(45, color="#f85149", linestyle="--", linewidth=1.2, label="Safety limit 45 °C")
+ax3.axhline(45, color="#f85149", linestyle="--", linewidth=1.2, label="Safety limit 45 °C")
 ax1.set_title("State of charge")
 ax1.set_ylabel("SOC (%)")
-ax2.set_title("Cell temperature")
-ax2.set_ylabel("Temperature (°C)")
-for ax in (ax1, ax2):
+ax2.set_title("Charging current")
+ax2.set_ylabel("C-rate (1C = 3 A)")
+ax3.set_title("Cell temperature")
+ax3.set_ylabel("Temperature (°C)")
+for ax in (ax1, ax2, ax3):
     ax.set_xlabel("Time (min)")
     ax.legend(facecolor="#0d1117", edgecolor="#21262d", labelcolor="#c9d1d9", fontsize=9)
 fig.tight_layout()

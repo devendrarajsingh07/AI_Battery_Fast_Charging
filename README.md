@@ -23,16 +23,17 @@ voltage limit sooner and ages faster. Conventional CC-CV charging handles this w
 
 This project trains a **Soft Actor-Critic (SAC)** agent to choose the charging current every simulated minute,
 using the cell's live state of charge, voltage, temperature and state of health. The cell is simulated with a
-simplified **Single Particle Model (SPM)** of an NMC 622 lithium-ion cell plus a lumped thermal model. A
-**Streamlit dashboard** lets you run the trained agent or a fixed current side by side and inspect every signal.
+simplified **Single Particle Model (SPM)** of an NMC 622 lithium-ion cell, a lumped thermal model and a CC-CV
+charger. A **Streamlit dashboard** lets you run the trained agent or a fixed C-rate and inspect every signal.
 
 | | |
 |---|---|
 | **Controller** | SAC (Stable-Baselines3, `MlpPolicy`), 20 000 training steps |
-| **Cell model** | Single Particle Model · NMC 622 OCV fit (Chen 2020) · 3 Ah cell |
+| **Cell model** | Single Particle Model · NMC 622 / graphite · 3 Ah, 18650 format |
 | **Observation** | `[SOC, terminal voltage, temperature, SOH]` |
-| **Action** | Charging current, continuous, `0.5 – 3.0` |
-| **Safety stops** | SOC ≥ 80 % · T ≥ 45 °C · V ≥ 4.20 V · SOH ≤ 0.80 |
+| **Action** | Requested charging current, `0.5C – 3.0C` (1.5 – 9 A) |
+| **Charger** | CC-CV: the requested current until 4.20 V, then constant voltage with tapering current |
+| **Episode ends** | SOC ≥ 80 % (success) · T ≥ 45 °C · SOH ≤ 0.80 · 3 h time limit |
 | **Interface** | Streamlit + Plotly dashboard |
 
 ---
@@ -41,21 +42,24 @@ simplified **Single Particle Model (SPM)** of an NMC 622 lithium-ion cell plus a
 
 ```mermaid
 flowchart LR
-    A["SAC agent<br/>(policy network)"] -- "charging current" --> B["Single Particle Model<br/>OCV · R_int(T) · η(i,T)"]
-    B --> C["Thermal model<br/>I²R heating − cooling"]
-    C --> D["Ageing model<br/>current + heat stress"]
-    D -- "SOC · V · T · SOH" --> A
-    D -. "reward" .-> A
+    A["SAC agent<br/>(policy network)"] -- "requested C-rate" --> B["CC-CV charger<br/>4.20 V limit"]
+    B -- "applied current" --> C["Single Particle Model<br/>OCV · R_int(T) · η(i,T)"]
+    C --> D["Thermal model<br/>ohmic + reaction heat"]
+    D --> E["Ageing model<br/>current + heat stress"]
+    E -- "SOC · V · T · SOH" --> A
+    E -. "reward" .-> A
 ```
 
 Each step simulates **60 seconds** of charging:
 
-1. **Electrochemistry.** SOC is updated by Coulomb counting, and the terminal voltage is computed as
+1. **Charger.** The agent requests a C-rate. The charger applies it unless that would push the terminal
+   voltage above 4.20 V. Past that point it holds 4.20 V and the current tapers, as a real CC-CV charger does.
+2. **Electrochemistry.** SOC is updated by Coulomb counting, and the terminal voltage is computed as
    `V = OCV(SOC) + i·R_int(T) + η(i, T)`.
-2. **Heat.** The cell warms with `I²R` heating and loses heat to a 25 °C ambient.
-3. **Ageing.** SOH drops with current stress (`∝ i²`) and with time spent above 35 °C.
-4. **Reward.** The agent is rewarded for charge gained and penalised for approaching the voltage limit,
-   running hot and losing health.
+3. **Heat.** Ohmic and reaction heat warm the cell, which cools to a 25 °C ambient.
+4. **Ageing.** SOH drops with current stress (`∝ C-rate²`) and with time spent above 35 °C.
+5. **Reward.** The agent earns reward for charge added and pays for every minute spent, for heat above 35 °C
+   and for capacity lost.
 
 <details>
 <summary><b>Physics model details</b></summary>
@@ -64,12 +68,13 @@ Each step simulates **60 seconds** of charging:
 
 | Term | Description |
 |------|-------------|
-| `OCV(SOC)` | Open-circuit voltage: degree-6 polynomial fit for NMC 622 (Chen 2020 half-cell data) |
+| `OCV(SOC)` | Full-cell open-circuit voltage: degree-6 polynomial, 3.00 V at 0 % → 3.70 V at 50 % → 4.20 V at 100 % |
 | `R_int(T)` | Internal resistance, 48 mΩ at 25 °C, falling 0.5 mΩ/°C above 25 °C (floor 10 mΩ) |
 | `η(i, T)` | Butler-Volmer overpotential, `(RT/αF)·asinh(i / 2i₀)` with an Arrhenius-like `i₀(T)` |
 | `ΔSOC` | Coulomb counting, `i·Δt / (3600·C_nom)` with `C_nom = 3 Ah`, `Δt = 60 s` |
-| Thermal | `T += 0.2·i² − 0.05·(T − T_amb)` per step |
-| SOH | `−8e-6·i² − 1.5e-5·max(T − 35, 0)` per step |
+| Thermal | `m·c_p·dT/dt = i²·R_int + i·η − hA·(T − T_amb)`, with `m·c_p = 45 J/K` and `hA = 0.20 W/K` |
+| CV limit | Largest current with `V ≤ 4.20 V`, solved by bisection each step |
+| SOH | `−8e-6·C² − 1.5e-5·max(T − 35, 0)` per step |
 
 References: Doyle, Fuller & Newman (1993) · Marquis et al. (2019) · Chen et al. (2020).
 
@@ -81,11 +86,11 @@ References: Doyle, Fuller & Newman (1993) · Marquis et al. (2019) · Chen et al
 <br/>
 
 ```text
-R =  20 · SOC
-  − 600 · max(V − 4.10, 0)                     # stay clear of the voltage cutoff
-  −   8 · max(T − 35, 0)                       # temperature above the comfort zone
-  − 120 · (1 − SOH)                            # ageing
-  −   2 · (i − 2.0) · (T − 32)   if T > 32 and i > 2.0   # no high current when already warm
+r =  200 · ΔSOC                     # charge added this step (140 in total for 10 → 80 %)
+  −    1                            # each minute of charging time
+  −    1 · max(T − 35, 0)           # heat above the comfort zone
+  − 4000 · ΔSOH_loss                # capacity lost this step
+  −  100   if T ≥ 45 °C             # safety limit reached (episode ends)
 ```
 
 </details>
@@ -94,26 +99,29 @@ R =  20 · SOC
 
 ## Results
 
-One episode per policy from 10 % SOC, reproduced with `python results/compare_policies.py`:
+One episode per policy from 10 % SOC at 25 °C, reproduced with `python results/compare_policies.py`.
+Each baseline is a standard CC-CV charge at a fixed C-rate.
 
 <p align="center">
-  <img src="results/plots/rl_vs_constant.png" alt="SAC agent vs constant-current charging: SOC and temperature over time" width="100%">
+  <img src="results/plots/rl_vs_constant.png" alt="SAC agent vs CC-CV charging: state of charge, current and temperature over time" width="100%">
 </p>
 
-| Policy | Charge time | Final SOC | Peak temperature | Final SOH | Episode ended by |
-|---|---:|---:|---:|---:|---|
-| **SAC agent** | **40 min** | **52.7 %** | **37.5 °C** | **0.9983** | 4.20 V cutoff |
-| Constant 1.5 | 52 min | 53.3 % | 33.4 °C | 0.9991 | 4.20 V cutoff |
-| Constant 2.0 | 38 min | 52.2 % | 38.7 °C | 0.9981 | 4.20 V cutoff |
-| Constant 2.5 | 30 min | 51.7 % | 44.6 °C | 0.9967 | 4.20 V cutoff |
+| Policy | Time to 80 % | Peak temperature | Final SOH | CV phase from |
+|---|---:|---:|---:|---:|
+| **SAC agent** | **22 min** | **35.2 °C** | **0.9993** | 76 % SOC |
+| CC-CV 1C | 42 min | 28.0 °C | 0.9997 | — |
+| CC-CV 2C | 22 min | 35.3 °C | 0.9993 | 76 % SOC |
+| CC-CV 3C | 16 min | 44.3 °C | 0.9977 | 65 % SOC |
 
-The agent ramps the current from about 1.8 up to 2.1 while the cell is cool, then backs off to about 1.8 once it
-passes 35 °C. It charges
-12 minutes faster than the gentle 1.5 profile, and runs 1.2 °C cooler than a fixed 2.0 for only 2 extra minutes.
-The aggressive 2.5 profile is fastest but finishes within half a degree of the 45 °C safety limit.
+- The agent reaches 80 % in **half the time of standard 1C charging**.
+- **3C is 6 minutes faster** but peaks at 44.3 °C, 0.7 °C below the safety limit, and costs about three
+  times the capacity loss.
+- The agent's profile is adaptive. It opens at about 2.9C while the cell is cool, drops back once the cell
+  nears 35 °C, then holds between 1.7C and 2C until the charger's CV phase takes over at 76 %.
+- From this one starting condition, the agent ends up matching a well-chosen fixed 2C rate.
 
 <details>
-<summary><b>Single-episode signal plots (fixed 1.7 current, <code>results/generate_plots.py</code>)</b></summary>
+<summary><b>Agent signal plots (<code>results/generate_plots.py</code>)</b></summary>
 
 <br/>
 
@@ -124,10 +132,10 @@ The aggressive 2.5 profile is fastest but finishes within half a degree of the 4
   </tr>
   <tr>
     <td><img src="results/plots/temperature_vs_time.png" alt="Temperature vs time"></td>
-    <td><img src="results/plots/soh_vs_time.png" alt="State of health vs time"></td>
+    <td><img src="results/plots/current_vs_time.png" alt="Charging current vs time"></td>
   </tr>
   <tr>
-    <td colspan="2"><img src="results/plots/current_vs_time.png" alt="Charging current vs time"></td>
+    <td colspan="2"><img src="results/plots/soh_vs_time.png" alt="State of health vs time"></td>
   </tr>
 </table>
 
@@ -164,8 +172,8 @@ scratch.
 ### Regenerate the plots
 
 ```bash
-python results/compare_policies.py   # agent vs constant current (table + chart)
-python results/generate_plots.py     # signal plots for a fixed 1.7 current
+python results/compare_policies.py   # agent vs CC-CV baselines (table + chart)
+python results/generate_plots.py     # signal plots for one agent episode
 ```
 
 ---
@@ -212,20 +220,20 @@ AI_Battery_Fast_Charging/
 
 ## Known limitations
 
-- **No constant-voltage phase.** Every episode ends at the 4.20 V cutoff at roughly 52 % SOC, before the
-  80 % target. A CV stage, or letting the agent taper current near the limit, is needed to reach full charge.
-- **Current units.** The dashboard labels the action as a C-rate, but the cell model applies it in amps.
-  On the 3 Ah cell, an action of 3.0 is 1C.
-- **Simplified models.** The thermal and ageing models are lumped, hand-calibrated approximations. They
-  have not been validated against measured cell data.
-- **Single starting condition.** Results come from one deterministic episode from 10 % SOC at 25 °C.
+- **One starting condition.** Training and evaluation both start at 10 % SOC and 25 °C. In this case a
+  well-tuned fixed rate (2C) is already close to optimal. An adaptive policy should pay off when the starting
+  charge and ambient temperature vary, which the environment does not randomise yet.
+- **Simplified models.** The OCV curve, thermal and ageing models are representative, hand-calibrated
+  approximations. They have not been validated against measured cell data.
+- **No lithium-plating model.** Ageing depends only on current and temperature, so the risk of plating
+  during high-current charging at high SOC or low temperature is not captured.
 
 ## Roadmap
 
-- [ ] CC-CV baseline and a constant-voltage phase in the environment
+- [ ] Randomised starting SOC and ambient temperature during training
+- [ ] Lithium-plating-aware ageing term
 - [ ] Full PyBaMM state coupling (solid diffusion, electrolyte dynamics)
 - [ ] Calibrate ageing against public datasets (NASA, Oxford battery degradation)
-- [ ] Randomised starting SOC and ambient temperature during training
 - [ ] Multi-cell pack simulation
 - [ ] Digital twin / hardware-in-the-loop export
 

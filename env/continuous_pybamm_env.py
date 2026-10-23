@@ -5,13 +5,20 @@ Observation space (4D):
   [SOC, Voltage (V), Temperature (°C), SOH]
 
 Action space (1D):
-  Charging current in C-rate units  → [0.5, 3.0]
+  Requested charging current as a C-rate → [0.5, 3.0]
+  (1C = 3 A for the 3 Ah cell, so 3.0 requests 9 A)
+
+Charger behaviour (CC-CV):
+  The requested current is applied as long as the terminal voltage stays at
+  or below 4.20 V. Once the cell reaches 4.20 V the charger holds the voltage
+  and tapers the current (constant-voltage phase), exactly as a real charger
+  does. The agent can always ask for less current than the CV limit.
 
 Episode ends when:
-  - SOC ≥ 0.80  (target reached)
-  - Temperature ≥ 45 °C  (thermal runaway risk)
-  - Voltage ≥ 4.20 V  (hardware cutoff)
-  - SOH drops below 0.80  (cell too degraded)
+  - SOC ≥ 0.80              (target reached — success)
+  - Temperature ≥ 45 °C     (thermal safety limit — failure)
+  - SOH ≤ 0.80              (cell too degraded — failure)
+  - 180 steps (3 h)         (time limit — truncated)
 """
 
 import gymnasium as gym
@@ -26,6 +33,13 @@ sys.path.append(
 
 from battery_model.thermal_model import ThermalModel
 from battery_model.spm_model import SingleParticleModel
+
+V_MAX = 4.20            # charge voltage limit (V)
+T_MAX = 45.0            # thermal safety limit (°C)
+T_COMFORT = 35.0        # heat penalty starts above this (°C)
+SOC_START = 0.10
+SOC_TARGET = 0.80
+MAX_STEPS = 180         # 3 h of simulated time
 
 
 class ContinuousBatteryEnv(gym.Env):
@@ -49,10 +63,7 @@ class ContinuousBatteryEnv(gym.Env):
 
         self.thermal = ThermalModel()
         self.spm = SingleParticleModel()
-
-        # SOH degradation accumulators
-        self._total_ah = 0.0          # lifetime Ah throughput
-        self._heat_integral = 0.0     # Σ max(T-35, 0) dt
+        self.capacity_ah = SingleParticleModel.CAPACITY_AH
 
         self.reset()
 
@@ -60,7 +71,7 @@ class ContinuousBatteryEnv(gym.Env):
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
 
-        self.soc = 0.10
+        self.soc = SOC_START
         self.soh = 1.0
         self.time_step = 0
 
@@ -68,13 +79,10 @@ class ContinuousBatteryEnv(gym.Env):
         self.thermal.ambient_temp = 25.0
         self.temperature = 25.0
 
-        self.spm.reset(soc_init=0.10)
+        self.spm.reset(soc_init=SOC_START)
 
         # voltage from SPM at rest (no current)
         self.voltage = self.spm.ocv()
-
-        self._total_ah = 0.0
-        self._heat_integral = 0.0
 
         return self._get_obs(), {}
 
@@ -86,87 +94,88 @@ class ContinuousBatteryEnv(gym.Env):
         )
 
     # ------------------------------------------------------------------
-    def _update_soh(self, current: float):
+    def _soh_loss(self, c_rate: float) -> float:
         """
-        Semi-empirical capacity fade model.
+        Semi-empirical capacity fade for one step.
 
         Two contributions:
-          1. Cycle-stress: proportional to i²  (high-current side reactions)
-          2. Calendar / thermal stress: Arrhenius-like excess-heat term
-
-        Calibrated so a 20 000-step run at 2C loses roughly 1-2 % SOH.
+          1. Cycle stress: proportional to (C-rate)²  (high-current side reactions)
+          2. Thermal stress: excess temperature above 35 °C
         """
-        cycle_loss = (current ** 2) * 8e-6
-        thermal_excess = max(0.0, self.temperature - 35.0)
-        thermal_loss = thermal_excess * 1.5e-5
-
-        self.soh -= cycle_loss + thermal_loss
-        self.soh = max(self.soh, 0.0)
+        cycle_loss = (c_rate ** 2) * 8e-6
+        thermal_loss = max(0.0, self.temperature - T_COMFORT) * 1.5e-5
+        return cycle_loss + thermal_loss
 
     # ------------------------------------------------------------------
-    def _calculate_reward(self, current: float) -> float:
+    def _calculate_reward(self, d_soc: float, soh_loss: float) -> float:
         """
-        Reward shaping:
-          +  fast SOC progress
-          -  voltage overshoot (heavy penalty near 4.2 V)
-          -  temperature above safe zone (35 °C)
-          -  SOH degradation
-          -  high current when already warm (discourages reckless charging)
+        Per-step reward:
+          +  charge added this step       (200 per unit SOC → 140 for 10 → 80 %)
+          −  1 per minute spent charging  (rewards finishing sooner)
+          −  heat above 35 °C
+          −  capacity lost this step
+          − 100 once if the 45 °C safety limit is reached
         """
-        r = self.soc * 20.0
-
-        # voltage guard
-        if self.voltage > 4.10:
-            r -= (self.voltage - 4.10) * 600.0
-
-        # temperature guard
-        if self.temperature > 35.0:
-            r -= (self.temperature - 35.0) * 8.0
-
-        # aging
-        r -= (1.0 - self.soh) * 120.0
-
-        # discourage high current when hot
-        if self.temperature > 32.0 and current > 2.0:
-            r -= (current - 2.0) * (self.temperature - 32.0) * 2.0
-
+        r = 200.0 * d_soc
+        r -= 1.0
+        r -= 1.0 * max(0.0, self.temperature - T_COMFORT)
+        r -= 4000.0 * soh_loss
+        if self.temperature >= T_MAX:
+            r -= 100.0
         return float(r)
 
     # ------------------------------------------------------------------
     def step(self, action):
-        current = float(np.clip(action[0], 0.5, 3.0))
+        requested_c = float(np.clip(action[0], 0.5, 3.0))
         self.time_step += 1
 
-        # — physics update —
+        # — charger: CC up to the requested rate, CV once at 4.20 V —
+        i_request = requested_c * self.capacity_ah
+        i_cv = self.spm.max_current_for_voltage(V_MAX, self.temperature, i_request)
+        current = min(i_request, i_cv)                      # amps
+        c_rate = current / self.capacity_ah
+        mode = "CC" if current >= i_request - 1e-9 else "CV"
+
+        # — electrochemistry (evaluated at the start-of-step temperature) —
+        eta = self.spm.overpotential(current, self.temperature)
+        heat_w = current ** 2 * self.spm.r_internal(self.temperature) + current * eta
+
+        prev_soc = self.soc
         self.spm.update_soc(current)
         self.soc = self.spm.soc
 
-        self.temperature = self.thermal.update(current)
+        self.voltage = min(
+            self.spm.terminal_voltage(current, self.temperature), V_MAX
+        )
 
-        # voltage via SPM (OCV + ohmic drop + overpotential)
-        self.voltage = self.spm.terminal_voltage(current, self.temperature)
+        # — heat and ageing —
+        self.temperature = self.thermal.update(current, heat_w=heat_w)
 
-        self._update_soh(current)
+        soh_loss = self._soh_loss(c_rate)
+        self.soh = max(self.soh - soh_loss, 0.0)
 
-        reward = self._calculate_reward(current)
+        reward = self._calculate_reward(self.soc - prev_soc, soh_loss)
 
         terminated = (
-            self.soc >= 0.80
-            or self.temperature >= 45.0
-            or self.voltage >= 4.20
+            self.soc >= SOC_TARGET
+            or self.temperature >= T_MAX
             or self.soh <= 0.80
         )
+        truncated = (not terminated) and self.time_step >= MAX_STEPS
 
         info = {
             "soc": self.soc,
             "voltage": self.voltage,
             "temperature": self.temperature,
             "soh": self.soh,
-            "current": current,
+            "current": c_rate,              # applied C-rate
+            "current_a": current,           # applied current in amps
+            "requested_c_rate": requested_c,
+            "mode": mode,
             "step": self.time_step,
         }
 
-        return self._get_obs(), reward, terminated, False, info
+        return self._get_obs(), reward, terminated, truncated, info
 
     # ------------------------------------------------------------------
     def render(self):
